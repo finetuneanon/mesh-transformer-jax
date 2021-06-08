@@ -15,7 +15,7 @@
     ],
   "gradient_accumulation_steps": 16,
   "keep_every": 10000,
-  "layers": 1,
+  "layers": 0,
   "lr": 0.00012,
   "model_dir": "mesh_jax_pile_6B_rotary",
   "n_heads": 8,

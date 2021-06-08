@@ -190,141 +190,30 @@ class EmbeddingShard(hk.Module):
 class TransformerLayerShard(hk.Module):
     def __init__(self, config, name=None, init_scale=1.):
         super().__init__(name=name)
-        heads = config["n_heads"]
-        dim = config["d_model"]
-        shards = config["cores_per_replica"]
-        norm = getnorm(config["norm"])
-        self.is_rotary = config["pe"] == "rotary"
-
-        assert dim % heads == 0
-        assert heads % shards == 0
-
-        self.dim = dim
-        self.dim_per_head = dim // heads
-        self.heads_per_shard = heads // shards
-        self.dim_per_shard = dim // shards
-        self.pe_rotary_dims = config.get("pe_rotary_dims", self.dim_per_head)
-
-        self.norm = norm
-
-        self.q = hk.Linear(self.dim_per_shard, with_bias=False)
-        self.v = hk.Linear(self.dim_per_shard, with_bias=False)
-        self.k = hk.Linear(self.dim_per_shard, with_bias=False)
-
-        self.o = hk.Linear(self.dim, with_bias=False,
-                           w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
-
-        self.dense_proj = hk.Linear(self.dim_per_shard * 4)
-        self.dense_proj_o = hk.Linear(self.dim,
-                                      w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
 
     def self_attn(self, q, v, k, attn_bias):
-        if self.is_rotary:
-            k_rot = k[:, :, :self.pe_rotary_dims]
-            k_pass = k[:, :, self.pe_rotary_dims:]
-
-            q_rot = q[:, :, :self.pe_rotary_dims]
-            q_pass = q[:, :, self.pe_rotary_dims:]
-
-            sincos = fixed_pos_embedding(k_rot)
-            q_rot = apply_rotary_pos_emb(q_rot, sincos)
-            k_rot = apply_rotary_pos_emb(k_rot, sincos)
-
-            k = jnp.concatenate([k_rot, k_pass], axis=-1)
-            q = jnp.concatenate([q_rot, q_pass], axis=-1)
-
-        attention_logits = jnp.einsum("thd,Thd->htT", q, k)
-
-        sqrt_key_size = np.sqrt(self.dim_per_head).astype(k.dtype)
-        attention_logits = attention_logits / sqrt_key_size
-
-        attention_logits += attn_bias
-
-        attention_weights = jax.nn.softmax(attention_logits)
-        attention_vec = jnp.einsum("htT,Thd->thd", attention_weights, v).reshape((-1, self.dim_per_shard))
-
-        return self.o(attention_vec)
+        return q
 
     def ff(self, x):
-        dense_proj = self.dense_proj(x)
-        dense_proj = jax.nn.gelu(dense_proj)
-        return self.dense_proj_o(dense_proj)
+        return x
 
     def qvk_proj(self, x):
-        q = self.q(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
-        v = self.v(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
-        k = self.k(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
-
-        return q, v, k
+        return x, x, x
 
     def __call__(self, x, attn_bias):
-        x = f_psum(x)
-        x = self.norm(x)
-
-        q, v, k = self.qvk_proj(x)
-
-        seq_len = x.shape[0]
-        causal_mask = np.tril(np.ones((seq_len, seq_len)))
-        bias = -1e10 * (1. - causal_mask)
-        bias += attn_bias
-
-        attn_out = self.self_attn(q, v, k, bias)
-        dense_out = self.ff(x)
-
-        return g_psum(attn_out + dense_out)
+        return g_psum(x)
 
     # iterate the decoding process by a single token
     def decode_once(self, decode_state, x, attn_bias):
-        x = f_psum(x)
-        x = self.norm(x)
-
-        assert x.shape[0] == 1
-
-        q, v, k = self.qvk_proj(x)
-
-        # add new kv to end
-        v = jnp.concatenate((decode_state["v"], v), axis=0)[1:]
-        k = jnp.concatenate((decode_state["k"], k), axis=0)[1:]
-
-        tokens_decoded = decode_state["tokens_decoded"] + 1
-        length = v.shape[0]
-
-        masked_tokens = length - tokens_decoded
-
-        attention_mask = jnp.arange(0, length) < masked_tokens
-        bias = (-1e10 * attention_mask)
-        bias += attn_bias
-
-        attn_out = self.self_attn(q, v, k, bias)
-        dense_out = self.ff(x)
-
-        return g_psum(attn_out + dense_out), {
-            "tokens_decoded": tokens_decoded,
-            "k": k,
-            "v": v
+        return g_psum(x), {
+            "tokens_decoded": decode_state["tokens_decoded"] + 1,
+            "k": x,
+            "v": x
         }
 
     # take in right aligned context tokens and generate an initial state
     def get_init_decode_state(self, x, given_length, attn_bias):
-        x = f_psum(x)
-        x = self.norm(x)
-
-        q, v, k = self.qvk_proj(x)
-
-        full_length = x.shape[0]
-        masked_tokens = full_length - given_length
-
-        seq_len = x.shape[0]
-        causal_mask = np.tril(np.ones((seq_len, seq_len)))
-
-        bias = -1e10 * (1. - causal_mask)  # regular AR masking
-        bias -= 1e10 * (jnp.arange(0, full_length) < masked_tokens)  # mask out zero tokens before context starts
-        bias += attn_bias  # finally add attn bias for rpe
-
-        attn_out = self.self_attn(q, v, k, bias)
-        dense_out = self.ff(x)
-
-        return g_psum(attn_out + dense_out), {"k": k, "v": v, "tokens_decoded": given_length.astype(jnp.uint32)}
+        return g_psum(x), {"k": x, "v": x, "tokens_decoded": given_length.astype(jnp.uint32)}
 
 
 class ProjectionShard(hk.Module):
@@ -332,19 +221,15 @@ class ProjectionShard(hk.Module):
         super().__init__(name=name)
         out_dim = config["n_vocab"]
         shards = config["cores_per_replica"]
-        norm = getnorm(config["norm"])
 
         assert out_dim % shards == 0
 
         self.dim = out_dim
         self.dim_per_shard = out_dim // shards
 
-        self.norm = norm
-
         self.proj = hk.Linear(self.dim_per_shard)
 
     def __call__(self, x):
-        x = self.norm(x)
         proj = self.proj(x)
 
         all_proj = jax.lax.all_gather(proj, 'shard')

@@ -1,0 +1,44 @@
+{
+  "anneal_steps": 300000,
+  "bucket": "neo-models",
+  "ckpt_every": 500,
+  "cores_per_replica": 8,
+  "d_model": 256,
+  "end_lr": 0.000012,
+  "eval_harness_tasks": [
+      "lambada",
+      "piqa",
+      "hellaswag",
+      "winogrande",
+      "mathqa",
+      "pubmedqa"
+    ],
+  "gradient_accumulation_steps": 16,
+  "keep_every": 10000,
+  "layers": 1,
+  "lr": 0.00012,
+  "model_dir": "mesh_jax_pile_6B_rotary",
+  "n_heads": 8,
+  "n_vocab": 50400,
+  "name": "GPT3_6B_pile_rotary",
+  "norm": "layernorm",
+  "optimizer": [
+      "optax._src.combine.chain.<locals>.init_fn",
+      "optax._src.combine.chain.<locals>.update_fn"
+    ],
+  "pe": "none",
+  "pe_rotary_dims": 64,
+  "per_replica_batch": 1,
+  "seq": 2048,
+  "total_steps": 350000,
+  "tpu_size": 256,
+  "train_set": "pile.train.index",
+  "val_batches": 100,
+  "val_every": 500,
+  "val_set": {
+      "owt": "openwebtext2_new_inputs.val.index",
+      "pile": "pile.val.index"
+    },
+  "warmup_steps": 3000,
+  "weight_decay": 0.1
+}

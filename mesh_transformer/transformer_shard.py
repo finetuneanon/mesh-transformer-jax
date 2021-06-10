@@ -168,7 +168,7 @@ class CausalTransformer:
         def init(key, x):
             def train_loss(x, y):
                 transformer = CausalTransformerShard(config)
-                return transformer.loss(x, y)
+                return transformer.loss([], x, y)[:-1]
 
             param_init_fn = hk.transform(hk.experimental.optimize_rng_use(train_loss)).init
 

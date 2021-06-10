@@ -8,7 +8,7 @@ import numpy as np
 import optax
 from jax.experimental.maps import thread_resources
 
-from mesh_transformer.layers import EmbeddingShard, TransformerLayerShard, RelativePositionEmbs, ProjectionShard
+from mesh_transformer.layers import EmbeddingShard, TransformerLayerShard, RelativePositionEmbs, ProjectionShard, trace, save_trace
 from mesh_transformer.util import to_f32, to_bf16
 
 
@@ -38,7 +38,7 @@ class CausalTransformerShard(hk.Module):
         else:
             self.rpe = None
 
-    def eval(self, context, target, z_loss=0., mask=0.0):
+    def eval(self, t, context, target, z_loss=0., mask=0.0):
         input_len = context.shape[0]
 
         if self.rpe is not None:
@@ -48,10 +48,10 @@ class CausalTransformerShard(hk.Module):
 
         attn_bias += mask
 
-        x = hk.remat(self.embed)(context)
+        x, t = hk.remat(self.embed)(t, context)
 
         for l in self.transformer_layers:
-            x = x + hk.remat(l)(x, attn_bias)
+            x, t = x + hk.remat(l)(t, x, attn_bias)
 
         return hk.remat(self.proj.loss)(x, target, z_loss)
 
@@ -65,7 +65,7 @@ class CausalTransformerShard(hk.Module):
             "correct": correct
         }
 
-    def generate_initial(self, context, length):
+    def generate_initial(self, t, context, length):
         # slice last token off the context (we use that in generate_once to generate the first new token)
         last = context[-1:]
         context = context[:-1]
@@ -77,18 +77,19 @@ class CausalTransformerShard(hk.Module):
         else:
             attn_bias = 0
 
-        x = self.embed(context)
+        x, t = self.embed(t, context)
 
         states = []
 
         for l in self.transformer_layers:
-            res, layer_state = l.get_init_decode_state(x, length - 1, attn_bias)
+            res, layer_state, t = l.get_init_decode_state(t, x, length - 1, attn_bias)
             x = x + res
             states.append(layer_state)
 
-        return self.proj(x), (last.astype(jnp.uint32), states, hk.next_rng_key())
+        proj, t = self.proj(t, x)
+        return proj, (last.astype(jnp.uint32), states, hk.next_rng_key()), t
 
-    def generate_once(self, new_tok, state):
+    def generate_once(self, t, new_tok, state):
         input_len = state[0]["v"].shape[0]
 
         if self.rpe is not None:
@@ -97,16 +98,17 @@ class CausalTransformerShard(hk.Module):
         else:
             attn_bias = 0
 
-        x = self.embed(new_tok)
+        x, t = self.embed(t, new_tok)
 
         new_states = []
 
         for l, s in zip(self.transformer_layers, state):
-            res, layer_state = l.decode_once(s, x, attn_bias)
+            res, layer_state, t = l.decode_once(t, s, x, attn_bias)
             x = x + res
             new_states.append(layer_state)
 
-        return self.proj(x), new_states
+        proj, t = self.proj(t, x)
+        return proj, new_states, t
 
 
 class CausalTransformer:
@@ -176,19 +178,19 @@ class CausalTransformer:
                 "opt_state": optimizer.init(params)
             }
 
-        def generate(state, key, ctx, ctx_length, aux, sampler_options):
+        def generate(state, key, t, ctx, ctx_length, aux, sampler_options):
             sampler = config["sampler"]
             gen_length = self.gen_length
 
-            def generate_sample(context, ctx_length, aux):
+            def generate_sample(t, context, ctx_length, aux):
                 transformer = CausalTransformerShard(config)
-                _, initial_state = transformer.generate_initial(context, ctx_length)
+                _, initial_state, t = transformer.generate_initial(t, context, ctx_length)
 
                 def generate_scan_fn(carry, sampler_input):
                     next_token, decode_state, sample_key = carry
                     sample_key, new_key = jax.random.split(sample_key)
 
-                    output, new_state = transformer.generate_once(next_token, decode_state)
+                    output, new_state, t = transformer.generate_once(t, next_token, decode_state)
                     next_token, sample_info = sampler(sample_key, output, sampler_input, **sampler_options)
 
                     output = (next_token, sample_info)
@@ -196,10 +198,10 @@ class CausalTransformer:
                     return new_carry, output
 
                 final_state, outputs = jax.lax.scan(generate_scan_fn, initial_state, xs=aux, length=gen_length)
-                return final_state, outputs
+                return final_state, outputs, t
 
             generate_fn = hk.transform(generate_sample).apply
-            return generate_fn(state["params"], key, ctx, ctx_length, aux)
+            return generate_fn(state["params"], key, t, ctx, ctx_length, aux)
 
         self.init_xmap = jax.experimental.maps.xmap(fun=init,
                                                     in_axes=(["shard", ...],
@@ -225,6 +227,7 @@ class CausalTransformer:
 
         self.generate_xmap = jax.experimental.maps.xmap(fun=generate,
                                                         in_axes=(["shard", ...],
+                                                                 ["batch", ...],
                                                                  ["batch", ...],
                                                                  ["batch", ...],
                                                                  ["batch", ...],
@@ -305,10 +308,15 @@ class CausalTransformer:
         batch_size = ctx.shape[0]
         aux = jnp.zeros((batch_size, gen_length), dtype=jnp.uint32)
         self.gen_length = gen_length
+        
+        t = {}
 
-        return self.generate_xmap(self.state,
+        final_state, outputs, t = self.generate_xmap(self.state,
                                   jnp.array(key.take(batch_size)),
+                                  t,
                                   ctx,
                                   np.array(ctx_length, dtype=np.uint32),
                                   aux,
                                   sampler_options)
+        save_trace(t)
+        return final_state, outputs

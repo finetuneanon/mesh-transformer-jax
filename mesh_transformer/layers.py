@@ -6,12 +6,12 @@ from einops import rearrange, repeat
 
 from mesh_transformer.util import f_psum, g_psum
 
-import os
-import torch
 trace_id = 0
 def save_trace(trace):
+    import os
     if not os.path.isdir("trace"):
         return
+    import torch
     for name in trace.keys():
         data = trace[name]
         filename = f"trace/{name}.pt"
@@ -237,7 +237,7 @@ class TransformerLayerShard(hk.Module):
                                       w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
 
     def self_attn(self, t, q, v, k, attn_bias):
-        trace(t, "attn_pre", {"q": q, "v": v, "k": k, "attn_bias", attn_bias})
+        trace(t, "attn_pre", {"q": q, "v": v, "k": k, "attn_bias": attn_bias})
         if self.is_rotary:
             k_rot = k[:, :, :self.pe_rotary_dims]
             k_pass = k[:, :, self.pe_rotary_dims:]

@@ -6,6 +6,21 @@ from einops import rearrange, repeat
 
 from mesh_transformer.util import f_psum, g_psum
 
+import os
+import torch
+trace_id = 0
+def save_trace(trace):
+    if not os.path.isdir("trace"):
+        return
+    for name in trace.keys():
+        data = trace[name]
+        filename = f"trace/{name}.pt"
+        torch.save(data, filename)
+
+def trace(t, name, data):
+    global trace_id
+    t[f"{trace_id:05d}_{name}"] = data
+    trace_id += 1
 
 class ReplicatedLayerNorm(hk.Module):
     def __init__(self, offset=True):
@@ -168,13 +183,16 @@ class EmbeddingShard(hk.Module):
 
         self.proj = hk.Linear(self.out_dim, w_init=hk.initializers.TruncatedNormal(stddev=1 / np.sqrt(in_dim)))
 
-    def __call__(self, x, dtype=jnp.bfloat16):
+    def __call__(self, t, x, dtype=jnp.bfloat16):
         shard_start_index = jax.lax.axis_index('shard') * self.in_dim_per_shard
 
+        trace(t, "embed_input", x)
         input_onehot = jax.nn.one_hot(x - shard_start_index, self.in_dim_per_shard)
+        trace(t, "embed_input_onehot", input_onehot)
         proj_out = self.proj(input_onehot)
 
         proj_out = g_psum(proj_out)
+        trace(t, "embed_proj_out", proj_out)
 
         if self.positional_embeddings is not None:
             all_pos_embed = jax.lax.all_gather(self.positional_embeddings, 'shard')
@@ -183,7 +201,7 @@ class EmbeddingShard(hk.Module):
 
             proj_out += all_pos_embed
 
-        return proj_out
+        return proj_out, t
 
 
 # We actually combine the FF and dense in one layer (i.e. compute in parallel) to minimize all reduces
@@ -218,7 +236,8 @@ class TransformerLayerShard(hk.Module):
         self.dense_proj_o = hk.Linear(self.dim,
                                       w_init=hk.initializers.TruncatedNormal(stddev=init_scale / np.sqrt(self.dim)))
 
-    def self_attn(self, q, v, k, attn_bias):
+    def self_attn(self, t, q, v, k, attn_bias):
+        trace(t, "attn_pre", {"q": q, "v": v, "k": k, "attn_bias", attn_bias})
         if self.is_rotary:
             k_rot = k[:, :, :self.pe_rotary_dims]
             k_pass = k[:, :, self.pe_rotary_dims:]
@@ -227,60 +246,85 @@ class TransformerLayerShard(hk.Module):
             q_pass = q[:, :, self.pe_rotary_dims:]
 
             sincos = fixed_pos_embedding(k_rot)
+            trace(t, "attn_sincos", {"k_rot": k_rot, "q_rot": q_rot, "sincos": sincos})
             q_rot = apply_rotary_pos_emb(q_rot, sincos)
             k_rot = apply_rotary_pos_emb(k_rot, sincos)
+            trace(t, "attn_rotary_applied", {"k_rot": k_rot, "q_rot": q_rot})
 
             k = jnp.concatenate([k_rot, k_pass], axis=-1)
             q = jnp.concatenate([q_rot, q_pass], axis=-1)
+            trace(t, "attn_rotary_applied_cat", {"k": k, "q": q})
 
         attention_logits = jnp.einsum("thd,Thd->htT", q, k)
+        trace(t, "attn_logits", {"attention_logits": attention_logits})
 
         sqrt_key_size = np.sqrt(self.dim_per_head).astype(k.dtype)
         attention_logits = attention_logits / sqrt_key_size
+        trace(t, "attn_logits_scaled", {"attention_logits": attention_logits, "sqrt_key_size": sqrt_key_size})
 
         attention_logits += attn_bias
+        trace(t, "attn_logits_scaled_biased", {"attention_logits": attention_logits})
 
         attention_weights = jax.nn.softmax(attention_logits)
+        trace(t, "attn_logits_softmax", {"attention_weights": attention_weights})
         attention_vec = jnp.einsum("htT,Thd->thd", attention_weights, v).reshape((-1, self.dim_per_shard))
+        trace(t, "attn_vec", {"attention_vec": attention_vec})
+        
+        attn_ret = self.o(attention_vec)
+        trace(t, "attn_ret_o_proj", {"attn_ret": attn_ret})
 
-        return self.o(attention_vec)
+        return attn_ret, t
 
-    def ff(self, x):
+    def ff(self, t, x):
+        trace(t, "ff_pre", {"x": x})
         dense_proj = self.dense_proj(x)
+        trace(t, "ff_dense_proj", {"dense_proj": dense_proj})
         dense_proj = jax.nn.gelu(dense_proj)
-        return self.dense_proj_o(dense_proj)
+        trace(t, "ff_dense_proj_gelu", {"dense_proj": dense_proj})
+        ff_ret = self.dense_proj_o(dense_proj)
+        trace(t, "ff_proj_o_post", {"ff_ret": ff_ret})
+        return ff_ret, t
 
-    def qvk_proj(self, x):
+    def qvk_proj(self, t, x):
+        trace(t, "qvk_proj_pre", {"x": x})
         q = self.q(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
         v = self.v(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
         k = self.k(x).reshape(x.shape[:-1] + (self.heads_per_shard, self.dim_per_head))
+        trace(t, "qvk_proj_post", {"q": q, "v": v, "k": k})
 
-        return q, v, k
+        return q, v, k, t
 
-    def __call__(self, x, attn_bias):
+    def __call__(self, t, x, attn_bias):
         x = f_psum(x)
+        trace(t, "block_pre", {"x": x})
         x = self.norm(x)
+        trace(t, "block_norm", {"x": x})
 
-        q, v, k = self.qvk_proj(x)
+        q, v, k, t = self.qvk_proj(t, x)
 
         seq_len = x.shape[0]
         causal_mask = np.tril(np.ones((seq_len, seq_len)))
         bias = -1e10 * (1. - causal_mask)
         bias += attn_bias
 
-        attn_out = self.self_attn(q, v, k, bias)
-        dense_out = self.ff(x)
+        attn_out, t = self.self_attn(t, q, v, k, bias)
+        dense_out, t = self.ff(t, x)
 
-        return g_psum(attn_out + dense_out)
+        attn_ret = g_psum(attn_out + dense_out)
+        trace(t, "block_attn_ret", {"attn_ret": attn_ret})
+
+        return attn_ret, t
 
     # iterate the decoding process by a single token
-    def decode_once(self, decode_state, x, attn_bias):
+    def decode_once(self, decode_state, t, x, attn_bias):
         x = f_psum(x)
+        trace(t, "doblock_pre", {"x": x})
         x = self.norm(x)
+        trace(t, "doblock_norm", {"x": x})
 
         assert x.shape[0] == 1
 
-        q, v, k = self.qvk_proj(x)
+        q, v, k, t = self.qvk_proj(t, x)
 
         # add new kv to end
         v = jnp.concatenate((decode_state["v"], v), axis=0)[1:]
@@ -295,21 +339,27 @@ class TransformerLayerShard(hk.Module):
         bias = (-1e10 * attention_mask)
         bias += attn_bias
 
-        attn_out = self.self_attn(q, v, k, bias)
-        dense_out = self.ff(x)
+        attn_out, t = self.self_attn(t, q, v, k, bias)
+        dense_out, t = self.ff(t, x)
 
-        return g_psum(attn_out + dense_out), {
+        attn_ret = g_psum(attn_out + dense_out)
+        block_out = {
             "tokens_decoded": tokens_decoded,
             "k": k,
             "v": v
         }
+        trace(t, "doblock_attn_ret", {"attn_ret": attn_ret, "block_out": block_out})
+        
+        return attn_ret, block_out, t
 
     # take in right aligned context tokens and generate an initial state
-    def get_init_decode_state(self, x, given_length, attn_bias):
+    def get_init_decode_state(self, t, x, given_length, attn_bias):
         x = f_psum(x)
+        trace(t, "gidblock_pre", {"x": x})
         x = self.norm(x)
+        trace(t, "gidblock_norm", {"x": x})
 
-        q, v, k = self.qvk_proj(x)
+        q, v, k, t = self.qvk_proj(t, x)
 
         full_length = x.shape[0]
         masked_tokens = full_length - given_length
@@ -321,10 +371,14 @@ class TransformerLayerShard(hk.Module):
         bias -= 1e10 * (jnp.arange(0, full_length) < masked_tokens)  # mask out zero tokens before context starts
         bias += attn_bias  # finally add attn bias for rpe
 
-        attn_out = self.self_attn(q, v, k, bias)
-        dense_out = self.ff(x)
+        attn_out, t = self.self_attn(t, q, v, k, bias)
+        dense_out, t = self.ff(t, x)
+        
+        attn_ret = g_psum(attn_out + dense_out)
+        block_out = {"k": k, "v": v, "tokens_decoded": given_length.astype(jnp.uint32)}
+        trace(t, "gidblock_attn_ret", {"attn_ret": attn_ret, "block_out": block_out})
 
-        return g_psum(attn_out + dense_out), {"k": k, "v": v, "tokens_decoded": given_length.astype(jnp.uint32)}
+        return attn_ret, block_out, t
 
 
 class ProjectionShard(hk.Module):
@@ -343,13 +397,20 @@ class ProjectionShard(hk.Module):
 
         self.proj = hk.Linear(self.dim_per_shard)
 
-    def __call__(self, x):
+    def __call__(self, t, x):
+        trace(t, "proj_pre", {"x": x})
         x = self.norm(x)
+        trace(t, "proj_norm", {"x": x})
         proj = self.proj(x)
+        trace(t, "proj_proj", {"x": x})
 
         all_proj = jax.lax.all_gather(proj, 'shard')
+        trace(t, "proj_proj", {"all_proj": all_proj})
+        
+        proj_ret = hk.Flatten()(jnp.transpose(all_proj, (1, 0, 2)))
+        trace(t, "proj_ret", {"proj_ret": proj_ret})
 
-        return hk.Flatten()(jnp.transpose(all_proj, (1, 0, 2)))
+        return proj_ret, t
 
     def loss(self, x, targets, z_loss=1):
         x = f_psum(x)

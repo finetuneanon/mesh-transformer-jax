@@ -53,17 +53,17 @@ class CausalTransformerShard(hk.Module):
         for l in self.transformer_layers:
             x, t = x + hk.remat(l)(t, x, attn_bias)
 
-        return hk.remat(self.proj.loss)(x, target, z_loss)
+        return hk.remat(self.proj.loss)(x, target, z_loss), t
 
-    def loss(self, ctx, tgt, z_loss=False, mask=0.0):
-        loss, correct = self.eval(ctx, tgt, float(z_loss), mask=mask)
+    def loss(self, t, ctx, tgt, z_loss=False, mask=0.0):
+        loss, correct, t = self.eval(t, ctx, tgt, float(z_loss), mask=mask)
 
         return {
             "loss": loss.mean(),
             "last_loss": loss[-1].mean(),
             "all_loss": loss,
             "correct": correct
-        }
+        }, t
 
     def generate_initial(self, t, context, length):
         # slice last token off the context (we use that in generate_once to generate the first new token)
@@ -213,6 +213,7 @@ class CausalTransformer:
                                                     in_axes=(["shard", ...],
                                                              ["batch", ...],
                                                              ["batch", ...],
+                                                             ["batch", ...],
                                                              ["batch", ...]),
                                                     out_axes=["batch", ...],
                                                     axis_resources={'shard': 'mp', 'batch': 'dp'})
@@ -295,7 +296,8 @@ class CausalTransformer:
         else:
             ctx_length = np.array([len(sample["obs"][0])] * len(sample["obs"]))
 
-        out = self.eval_xmap(self.state, sample["obs"], sample["target"], ctx_length)
+        t = []
+        out, t = self.eval_xmap(self.state, t, sample["obs"], sample["target"], ctx_length)
         # print(f"eval dispatched in {time.time() - start:.06}s")
 
         # np.array(out["loss"])
@@ -309,7 +311,7 @@ class CausalTransformer:
         aux = jnp.zeros((batch_size, gen_length), dtype=jnp.uint32)
         self.gen_length = gen_length
         
-        t = {}
+        t = []
 
         final_state, outputs, t = self.generate_xmap(self.state,
                                   jnp.array(key.take(batch_size)),

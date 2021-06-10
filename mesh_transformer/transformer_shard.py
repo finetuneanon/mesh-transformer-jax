@@ -51,12 +51,14 @@ class CausalTransformerShard(hk.Module):
         x, t = hk.remat(self.embed)(t, context)
 
         for l in self.transformer_layers:
-            x, t = x + hk.remat(l)(t, x, attn_bias)
+            x_n, t = hk.remat(l)(t, x, attn_bias)
+            x = x + x_n
 
         return hk.remat(self.proj.loss)(x, target, z_loss), t
 
     def loss(self, t, ctx, tgt, z_loss=False, mask=0.0):
-        loss, correct, t = self.eval(t, ctx, tgt, float(z_loss), mask=mask)
+        loss_correct, t = self.eval(t, ctx, tgt, float(z_loss), mask=mask)
+        loss, correct = loss_correct
 
         return {
             "loss": loss.mean(),
@@ -119,7 +121,7 @@ class CausalTransformer:
         def eval(state, ctx, tgt, ctx_length):
             def eval_loss(x, y, mask):
                 transformer = CausalTransformerShard(config)
-                return transformer.loss(x, y, mask=mask)
+                return transformer.loss([], x, y, mask=mask)[:-1]
 
             eval_loss_fn = hk.without_apply_rng(hk.transform(eval_loss)).apply
 
@@ -130,7 +132,7 @@ class CausalTransformer:
         def train(state, ctx, tgt):
             def train_loss(x, y):
                 transformer = CausalTransformerShard(config)
-                out = transformer.loss(x, y, z_loss=True)
+                out = transformer.loss([], x, y, z_loss=True)[:-1]
 
                 return out["loss"], out["last_loss"]
 

@@ -317,7 +317,7 @@ class TransformerLayerShard(hk.Module):
         return attn_ret, t
 
     # iterate the decoding process by a single token
-    def decode_once(self, decode_state, t, x, attn_bias):
+    def decode_once(self, t, decode_state, x, attn_bias):
         x = f_psum(x)
         trace(t, "doblock_pre", {"x": x})
         x = self.norm(x)

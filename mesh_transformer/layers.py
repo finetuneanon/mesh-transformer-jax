@@ -12,14 +12,14 @@ def save_trace(trace):
     if not os.path.isdir("trace"):
         return
     import torch
-    for name in trace.keys():
-        data = trace[name]
-        filename = f"trace/{name}.pt"
+    for i in trace:
+        data = i[1]
+        filename = f"trace/{i[0]}.pt"
         torch.save(data, filename)
 
 def trace(t, name, data):
     global trace_id
-    t[f"{trace_id:05d}_{name}"] = data
+    t.append([f"{trace_id:05d}_{name}", data])
     trace_id += 1
 
 class ReplicatedLayerNorm(hk.Module):
